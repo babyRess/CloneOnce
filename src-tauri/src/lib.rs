@@ -3,9 +3,10 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 const WRAPPER_ICON: &[u8] = include_bytes!("../resources/cloneonce.icns");
@@ -251,11 +252,13 @@ fn inspect_app_bundle_at(path: &Path) -> Result<AppInspection, String> {
     }
 
     let icon_file = plist_string(&plist, "CFBundleIconFile");
-    let sandboxed = detect_sandbox(path);
+    let entitlements = read_code_sign_entitlements(path);
+    let sandboxed = detect_sandbox(&entitlements);
     let (compatibility, preset) = infer_compatibility(&name, &bundle_id, sandboxed, &plist);
     if sandboxed {
         warnings.push("Sandboxed targets may not support custom HOME data redirection.".into());
     }
+    warnings.extend(entitlement_warnings(&entitlements));
     if compatibility == "unknown" {
         warnings
             .push("No app-specific preset found. Start with HOME override or command mode.".into());
@@ -302,21 +305,98 @@ fn plist_string(plist: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn detect_sandbox(path: &Path) -> bool {
+fn read_code_sign_entitlements(path: &Path) -> Result<Value, String> {
     let output = Command::new("/usr/bin/codesign")
         .args([
             "-d",
             "--entitlements",
-            ":-",
+            "-",
+            "--xml",
             path.to_string_lossy().as_ref(),
         ])
-        .output();
-    output
+        .output()
+        .map_err(|err| format!("Could not run codesign: {err}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("codesign exited with status {}", output.status)
+        } else {
+            detail
+        });
+    }
+    parse_plist_json_bytes(&output.stdout, "code-signing entitlements")
+}
+
+fn parse_plist_json_bytes(bytes: &[u8], description: &str) -> Result<Value, String> {
+    let mut child = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "--", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Could not run plutil for {description}: {err}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| format!("Could not open plutil input for {description}."))?
+        .write_all(bytes)
+        .map_err(|err| format!("Could not send {description} to plutil: {err}"))?;
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("Could not read plutil output for {description}: {err}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("Could not parse {description}.")
+        } else {
+            format!("Could not parse {description}: {detail}")
+        });
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("Could not parse {description}: {err}"))
+}
+
+fn detect_sandbox(entitlements: &Result<Value, String>) -> bool {
+    entitlements
+        .as_ref()
         .ok()
-        .map(|item| {
-            String::from_utf8_lossy(&item.stdout).contains("com.apple.security.app-sandbox")
-        })
+        .and_then(|plist| plist.get("com.apple.security.app-sandbox"))
+        .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn uses_shared_security_groups(entitlements: &Result<Value, String>) -> bool {
+    entitlements.as_ref().ok().is_some_and(|plist| {
+        [
+            "keychain-access-groups",
+            "com.apple.security.application-groups",
+        ]
+        .iter()
+        .any(|key| plist.get(*key).is_some_and(entitlement_has_values))
+    })
+}
+
+fn entitlement_has_values(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => !items.is_empty(),
+        Value::String(item) => !item.trim().is_empty(),
+        Value::Null => false,
+        _ => true,
+    }
+}
+
+fn entitlement_warnings(entitlements: &Result<Value, String>) -> Vec<String> {
+    match entitlements {
+        Err(error) => vec![format!(
+            "Code-signing entitlements could not be inspected. Sandbox status and shared login storage could not be confirmed: {error}"
+        )],
+        Ok(_) if uses_shared_security_groups(entitlements) => vec![
+            "Target uses shared Keychain or app groups. CloneOnce can isolate files and profiles, but a wrapper cannot guarantee a separate login."
+                .into(),
+        ],
+        Ok(_) => Vec::new(),
+    }
 }
 
 fn infer_compatibility(
@@ -497,17 +577,19 @@ fn launcher_script(
         if preset_lower.contains("electron") {
             script.push_str("HOME_PATH=\"$DATA_PATH/Home\"\n");
             script.push_str("BROWSER_PROFILE=\"$DATA_PATH/Browser\"\n");
-            script.push_str("mkdir -p -- \"$HOME_PATH\" \"$HOME_PATH/.config\" \"$HOME_PATH/.cache\" \"$HOME_PATH/.local/share\" \"$BROWSER_PROFILE\"\n");
+            script.push_str("mkdir -p -- \"$HOME_PATH\" \"$HOME_PATH/.config\" \"$HOME_PATH/.cache\" \"$HOME_PATH/.local/share\" \"$HOME_PATH/.codex\" \"$BROWSER_PROFILE\"\n");
             script.push_str("export HOME=\"$HOME_PATH\"\n");
             script.push_str("export XDG_CONFIG_HOME=\"$HOME_PATH/.config\"\n");
             script.push_str("export XDG_CACHE_HOME=\"$HOME_PATH/.cache\"\n");
             script.push_str("export XDG_DATA_HOME=\"$HOME_PATH/.local/share\"\n");
+            script.push_str("export CODEX_HOME=\"$HOME_PATH/.codex\"\n");
             if uses_system_open {
                 script.push_str("OPEN_ENV_ARGS+=(--env \"HOME=$HOME_PATH\")\n");
                 script.push_str("OPEN_ENV_ARGS+=(--env \"XDG_CONFIG_HOME=$HOME_PATH/.config\")\n");
                 script.push_str("OPEN_ENV_ARGS+=(--env \"XDG_CACHE_HOME=$HOME_PATH/.cache\")\n");
                 script
                     .push_str("OPEN_ENV_ARGS+=(--env \"XDG_DATA_HOME=$HOME_PATH/.local/share\")\n");
+                script.push_str("OPEN_ENV_ARGS+=(--env \"CODEX_HOME=$HOME_PATH/.codex\")\n");
             }
             if !has_profile_arg {
                 script.push_str("ARGS+=(\"--user-data-dir=$BROWSER_PROFILE\")\n");
@@ -759,7 +841,83 @@ mod tests {
     }
 
     #[test]
-    fn electron_automatic_strategy_isolates_home_and_browser_profile() {
+    fn sandbox_detection_requires_a_true_boolean_entitlement() {
+        let enabled = Ok(json!({ "com.apple.security.app-sandbox": true }));
+        let disabled = Ok(json!({ "com.apple.security.app-sandbox": false }));
+        let missing = Ok(json!({ "keychain-access-groups": ["TEAM.example"] }));
+        let malformed = Ok(json!({ "com.apple.security.app-sandbox": "true" }));
+        let read_error = Err("codesign failed".into());
+
+        assert!(detect_sandbox(&enabled));
+        assert!(!detect_sandbox(&disabled));
+        assert!(!detect_sandbox(&missing));
+        assert!(!detect_sandbox(&malformed));
+        assert!(!detect_sandbox(&read_error));
+    }
+
+    #[test]
+    fn false_sandbox_entitlement_keeps_electron_preset_supported() {
+        let entitlements = Ok(json!({ "com.apple.security.app-sandbox": false }));
+        let plist = json!({ "ElectronAsarIntegrity": {} });
+
+        let sandboxed = detect_sandbox(&entitlements);
+        let (compatibility, preset) =
+            infer_compatibility("ChatGPT", "com.openai.codex", sandboxed, &plist);
+
+        assert!(!sandboxed);
+        assert_eq!(compatibility, "supported");
+        assert_eq!(preset, "Electron isolated HOME + --user-data-dir");
+    }
+
+    #[test]
+    fn shared_security_group_detection_covers_keychain_and_application_groups() {
+        let keychain = Ok(json!({ "keychain-access-groups": ["TEAM.example"] }));
+        let application = Ok(json!({ "com.apple.security.application-groups": ["TEAM.example"] }));
+        let empty_groups = Ok(json!({
+            "keychain-access-groups": [],
+            "com.apple.security.application-groups": []
+        }));
+
+        assert!(uses_shared_security_groups(&keychain));
+        assert!(uses_shared_security_groups(&application));
+        assert!(!uses_shared_security_groups(&empty_groups));
+    }
+
+    #[test]
+    fn sandbox_detection_parses_codesign_style_xml_plists() {
+        let enabled = parse_plist_json_bytes(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><true/>
+<key>keychain-access-groups</key><array><string>TEAM.example</string></array>
+</dict></plist>"#,
+            "test entitlements",
+        );
+        let disabled = parse_plist_json_bytes(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>com.apple.security.app-sandbox</key><false/>
+</dict></plist>"#,
+            "test entitlements",
+        );
+        let malformed = parse_plist_json_bytes(b"not a plist", "test entitlements");
+
+        assert!(detect_sandbox(&enabled));
+        assert!(uses_shared_security_groups(&enabled));
+        assert!(entitlement_warnings(&enabled)
+            .iter()
+            .any(|warning| warning.contains("cannot guarantee a separate login")));
+        assert!(!detect_sandbox(&disabled));
+        assert!(malformed.is_err());
+        assert!(!detect_sandbox(&malformed));
+        assert!(entitlement_warnings(&malformed)
+            .iter()
+            .any(|warning| warning.contains("could not be inspected")));
+    }
+
+    #[test]
+    fn electron_automatic_dock_launch_isolates_home_xdg_codex_and_browser_profile() {
         let config = base_config();
         let env_vars = BTreeMap::new();
         let args = Vec::new();
@@ -776,8 +934,59 @@ mod tests {
 
         assert!(script.contains("HOME_PATH=\"$DATA_PATH/Home\""));
         assert!(script.contains("BROWSER_PROFILE=\"$DATA_PATH/Browser\""));
+        assert!(script.contains("\"$HOME_PATH/.codex\""));
         assert!(script.contains("export HOME=\"$HOME_PATH\""));
+        assert!(script.contains("export XDG_CONFIG_HOME=\"$HOME_PATH/.config\""));
+        assert!(script.contains("export XDG_CACHE_HOME=\"$HOME_PATH/.cache\""));
+        assert!(script.contains("export XDG_DATA_HOME=\"$HOME_PATH/.local/share\""));
+        assert!(script.contains("export CODEX_HOME=\"$HOME_PATH/.codex\""));
         assert!(script.contains("ARGS+=(\"--user-data-dir=$BROWSER_PROFILE\")"));
+        assert!(!script.contains("OPEN_ENV_ARGS"));
+    }
+
+    #[test]
+    fn persistent_electron_launcher_never_removes_its_profile() {
+        let mut config = base_config();
+        config.erase_on_close = false;
+
+        let script = launcher_script(
+            &config,
+            Path::new("/Applications/ChatGPT.app"),
+            Some("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+            "/Users/test/CloneOnce/Profiles/ChatGPT2",
+            "Electron isolated HOME + --user-data-dir",
+            &[],
+            &BTreeMap::new(),
+        );
+
+        assert!(!script.contains("rm -rf"));
+    }
+
+    #[test]
+    fn electron_browser_profile_system_launch_propagates_isolated_environment() {
+        let mut config = base_config();
+        config.launch_mode = "systemLaunch".into();
+        config.data_strategy = "browserProfile".into();
+        let env_vars = BTreeMap::new();
+        let args = Vec::new();
+
+        let script = launcher_script(
+            &config,
+            Path::new("/Applications/Codex.app"),
+            Some("/Applications/Codex.app/Contents/MacOS/Codex"),
+            "/tmp/codex-profile",
+            "Electron isolated HOME + --user-data-dir",
+            &args,
+            &env_vars,
+        );
+
+        assert!(script.contains("OPEN_ENV_ARGS+=(--env \"HOME=$HOME_PATH\")"));
+        assert!(script.contains("OPEN_ENV_ARGS+=(--env \"XDG_CONFIG_HOME=$HOME_PATH/.config\")"));
+        assert!(script.contains("OPEN_ENV_ARGS+=(--env \"XDG_CACHE_HOME=$HOME_PATH/.cache\")"));
+        assert!(script.contains("OPEN_ENV_ARGS+=(--env \"XDG_DATA_HOME=$HOME_PATH/.local/share\")"));
+        assert!(script.contains("OPEN_ENV_ARGS+=(--env \"CODEX_HOME=$HOME_PATH/.codex\")"));
+        assert!(script.contains("ARGS+=(\"--user-data-dir=$BROWSER_PROFILE\")"));
+        assert!(script.contains("/usr/bin/open -n"));
     }
 
     #[test]

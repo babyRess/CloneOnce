@@ -41,6 +41,8 @@ provide:
 
 - code-signed or notarized distribution builds
 - a compiled helper runner inside generated wrappers
+- full login isolation for apps that use shared Keychain access groups or app
+  groups; file/profile isolation cannot separate those credentials
 - guaranteed Dock ownership for every app
 - menu bar controls
 - Dock icon effects
